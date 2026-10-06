@@ -21,6 +21,13 @@ type solver struct {
 	played  [][]bool // played[i][j]: i and j have met before
 	diff    []int    // current white-minus-black count per player
 
+	// Fixed/forbidden-pair and bye restrictions (empty = unrestricted,
+	// matching the original /pair behaviour).
+	forcedWith []int  // forcedWith[i] = j forces i and j into one game; -1 otherwise
+	forcedW    []bool // forcedW[i]: in the forced game, i plays white
+	blocked    [][]bool
+	byeAllowed []bool // nil means every player may take the bye
+
 	found   bool
 	bestSP  int
 	bestCP  int
@@ -33,11 +40,16 @@ type solver struct {
 func newSolver(players []Player) *solver {
 	n := len(players)
 	s := &solver{
-		n:       n,
-		players: players,
-		played:  make([][]bool, n),
-		diff:    make([]int, n),
-		bestBye: -1,
+		n:          n,
+		players:    players,
+		played:     make([][]bool, n),
+		diff:       make([]int, n),
+		forcedWith: make([]int, n),
+		forcedW:    make([]bool, n),
+		bestBye:    -1,
+	}
+	for i := range s.forcedWith {
+		s.forcedWith[i] = -1
 	}
 	for i := range s.played {
 		s.played[i] = make([]bool, n)
@@ -68,6 +80,34 @@ func indexOf(players []Player, id string) int {
 	return -1
 }
 
+// solverConstraints is the already-indexed, structurally validated form of
+// a scheduleConstraints value. A nil ByeAllowed slice means every player is
+// eligible for the bye; an explicit (possibly empty) slice restricts it.
+type solverConstraints struct {
+	ForcedWith []int
+	ForcedW    []bool
+	Blocked    [][]bool
+	ByeAllowed []bool
+}
+
+// withConstraints installs fixed games, forbidden pairs and bye eligibility
+// for the upcoming solve. It must be called before solve.
+func (s *solver) withConstraints(c solverConstraints) *solver {
+	s.forcedWith = c.ForcedWith
+	s.forcedW = c.ForcedW
+	s.blocked = c.Blocked
+	s.byeAllowed = c.ByeAllowed
+	return s
+}
+
+func (s *solver) mayBye(i int) bool {
+	return s.byeAllowed == nil || s.byeAllowed[i]
+}
+
+func (s *solver) isBlocked(i, j int) bool {
+	return s.blocked != nil && s.blocked[i][j]
+}
+
 // solve returns ErrNoPairing if no complete legal schedule exists.
 func (s *solver) solve() (*PairResult, error) {
 	// |imbalance| >= 5 can never return to within 2 after one game
@@ -89,8 +129,13 @@ func (s *solver) solve() (*PairResult, error) {
 		s.match(free, pairs, -1, post)
 	} else {
 		for b := 0; b < s.n; b++ {
-			// A player who already had a bye cannot take another.
-			if len(s.players[b].Byes) > 0 {
+			// A player who already had a bye cannot take another, and the
+			// venue restriction may limit the bye to an explicit list.
+			if len(s.players[b].Byes) > 0 || !s.mayBye(b) {
+				continue
+			}
+			// A player locked into a fixed game cannot take the bye.
+			if s.forcedWith[b] >= 0 {
 				continue
 			}
 			free[b] = false
@@ -142,8 +187,23 @@ func (s *solver) match(free []bool, pairs [][2]int, bye int, post []int) {
 		return
 	}
 	free[i] = false
+	if fp := s.forcedWith[i]; fp >= 0 {
+		// i is fixed against fp; any matching in which fp is unavailable
+		// (already paired or taking the bye) cannot satisfy the fixture.
+		if free[fp] && !s.played[i][fp] && !s.isBlocked(i, fp) {
+			free[fp] = false
+			s.match(free, append(pairs, pairCanon(i, fp)), bye, post)
+			free[fp] = true
+		}
+		free[i] = true
+		return
+	}
 	for j := i + 1; j < s.n; j++ {
-		if !free[j] || s.played[i][j] {
+		if !free[j] || s.played[i][j] || s.isBlocked(i, j) {
+			continue
+		}
+		// j already locked into another fixed game.
+		if s.forcedWith[j] >= 0 {
 			continue
 		}
 		free[j] = false
@@ -151,6 +211,15 @@ func (s *solver) match(free []bool, pairs [][2]int, bye int, post []int) {
 		free[j] = true
 	}
 	free[i] = true
+}
+
+// pairCanon orders a forced pair by index so pairs stay in canonical
+// (smaller endpoint first) order.
+func pairCanon(i, j int) [2]int {
+	if i < j {
+		return [2]int{i, j}
+	}
+	return [2]int{j, i}
 }
 
 // assignColors enumerates white/black orientations pair by pair.
@@ -175,22 +244,34 @@ func (s *solver) assignColors(pairs [][2]int, bye int, post []int, k, sp, cp int
 	lo, hi := pairs[k][0], pairs[k][1]
 	spPair := absInt(s.players[lo].Score - s.players[hi].Score)
 
+	// Allowed orientations, indexed by the existing encoding: 0 = lo white,
+	// 1 = hi white. A fixed game pins exactly one orientation.
+	allow0, allow1 := true, true
+	if s.forcedWith[lo] == hi {
+		allow0 = s.forcedW[lo]
+		allow1 = !allow0
+	}
+
 	// Orientation 0: lo white, hi black.
-	dLo := s.diff[lo] + 1
-	dHi := s.diff[hi] - 1
-	if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
-		post[lo], post[hi] = dLo, dHi
-		s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
-			appendKey(key, lo, hi), appendOrient(orient, 0))
+	if allow0 {
+		dLo := s.diff[lo] + 1
+		dHi := s.diff[hi] - 1
+		if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
+			post[lo], post[hi] = dLo, dHi
+			s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
+				appendKey(key, lo, hi), appendOrient(orient, 0))
+		}
 	}
 
 	// Orientation 1: hi white, lo black.
-	dLo = s.diff[lo] - 1
-	dHi = s.diff[hi] + 1
-	if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
-		post[lo], post[hi] = dLo, dHi
-		s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
-			appendKey(key, hi, lo), appendOrient(orient, 1))
+	if allow1 {
+		dLo := s.diff[lo] - 1
+		dHi := s.diff[hi] + 1
+		if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
+			post[lo], post[hi] = dLo, dHi
+			s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
+				appendKey(key, hi, lo), appendOrient(orient, 1))
+		}
 	}
 }
 
