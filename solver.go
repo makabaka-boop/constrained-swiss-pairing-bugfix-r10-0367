@@ -21,6 +21,16 @@ type solver struct {
 	played  [][]bool // played[i][j]: i and j have met before
 	diff    []int    // current white-minus-black count per player
 
+	// Optional venue constraints.
+	// fixedMate[i] is j >= 0 when i is required to play j; the pair is
+	// stored on both endpoints. fixedOrient[{lo,hi}] is 0 when lo must be
+	// white and 1 when hi must be white.
+	fixedMate   []int
+	fixedOrient map[[2]int]int
+	forbidden   [][]bool // forbidden[i][j]: i and j must not meet
+	// byeOK[i] reports whether i may take the bye; nil means everybody may.
+	byeOK []bool
+
 	found   bool
 	bestSP  int
 	bestCP  int
@@ -59,6 +69,25 @@ func newSolver(players []Player) *solver {
 	return s
 }
 
+// apply installs parsed venue constraints onto the solver. Fixed games are
+// added to fixedMate/fixedOrient; forbidden pairs are folded into the
+// blocked-edge matrix used by the matching enumeration.
+func (s *solver) apply(c *parsedConstraints) {
+	s.fixedMate = c.fixedMate
+	s.fixedOrient = c.fixedOrient
+	if len(c.forbidden) > 0 {
+		s.forbidden = c.forbidden
+	}
+	s.byeOK = c.byeOK
+}
+
+// blocked reports whether the undirected pair (i, j) may not be played
+// next round, either because they already met or because the pair is
+// forbidden by the venue constraints.
+func (s *solver) blocked(i, j int) bool {
+	return s.played[i][j] || (s.forbidden != nil && s.forbidden[i][j])
+}
+
 func indexOf(players []Player, id string) int {
 	for i := range players {
 		if players[i].ID == id {
@@ -91,6 +120,15 @@ func (s *solver) solve() (*PairResult, error) {
 		for b := 0; b < s.n; b++ {
 			// A player who already had a bye cannot take another.
 			if len(s.players[b].Byes) > 0 {
+				continue
+			}
+			// A player named in a fixed game must play, never bye.
+			if s.fixedMate != nil && s.fixedMate[b] >= 0 {
+				continue
+			}
+			// Restricted bye list: only listed players may take the bye
+			// (nil list means everybody may; an empty list means nobody).
+			if s.byeOK != nil && !s.byeOK[b] {
 				continue
 			}
 			free[b] = false
@@ -142,13 +180,29 @@ func (s *solver) match(free []bool, pairs [][2]int, bye int, post []int) {
 		return
 	}
 	free[i] = false
-	for j := i + 1; j < s.n; j++ {
-		if !free[j] || s.played[i][j] {
-			continue
+	if s.fixedMate != nil && s.fixedMate[i] >= 0 {
+		// i has a fixed partner: that pair is forced and is the only
+		// branch worth exploring here.
+		j := s.fixedMate[i]
+		if j > i && free[j] && !s.blocked(i, j) {
+			free[j] = false
+			s.match(free, append(pairs, [2]int{i, j}), bye, post)
+			free[j] = true
 		}
-		free[j] = false
-		s.match(free, append(pairs, [2]int{i, j}), bye, post)
-		free[j] = true
+	} else {
+		for j := i + 1; j < s.n; j++ {
+			if !free[j] || s.blocked(i, j) {
+				continue
+			}
+			// j is itself fixed to another player (or fixed to i, which
+			// is handled by the forced branch above).
+			if s.fixedMate != nil && s.fixedMate[j] >= 0 {
+				continue
+			}
+			free[j] = false
+			s.match(free, append(pairs, [2]int{i, j}), bye, post)
+			free[j] = true
+		}
 	}
 	free[i] = true
 }
@@ -174,23 +228,33 @@ func (s *solver) assignColors(pairs [][2]int, bye int, post []int, k, sp, cp int
 
 	lo, hi := pairs[k][0], pairs[k][1]
 	spPair := absInt(s.players[lo].Score - s.players[hi].Score)
+	// Fixed games pin the orientation; other pairs keep both choices.
+	fixed := s.fixedOrient != nil
+	wantO, pinned := 0, false
+	if fixed {
+		wantO, pinned = s.fixedOrient[[2]int{lo, hi}]
+	}
 
 	// Orientation 0: lo white, hi black.
-	dLo := s.diff[lo] + 1
-	dHi := s.diff[hi] - 1
-	if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
-		post[lo], post[hi] = dLo, dHi
-		s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
-			appendKey(key, lo, hi), appendOrient(orient, 0))
+	if !pinned || wantO == 0 {
+		dLo := s.diff[lo] + 1
+		dHi := s.diff[hi] - 1
+		if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
+			post[lo], post[hi] = dLo, dHi
+			s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
+				appendKey(key, lo, hi), appendOrient(orient, 0))
+		}
 	}
 
 	// Orientation 1: hi white, lo black.
-	dLo = s.diff[lo] - 1
-	dHi = s.diff[hi] + 1
-	if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
-		post[lo], post[hi] = dLo, dHi
-		s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
-			appendKey(key, hi, lo), appendOrient(orient, 1))
+	if !pinned || wantO == 1 {
+		dLo := s.diff[lo] - 1
+		dHi := s.diff[hi] + 1
+		if absInt(dLo) <= 2 && absInt(dHi) <= 2 {
+			post[lo], post[hi] = dLo, dHi
+			s.assignColors(pairs, bye, post, k+1, sp+spPair, cp+absInt(dLo)+absInt(dHi),
+				appendKey(key, hi, lo), appendOrient(orient, 1))
+		}
 	}
 }
 

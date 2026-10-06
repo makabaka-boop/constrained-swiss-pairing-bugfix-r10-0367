@@ -32,6 +32,13 @@ func IsValidation(err error) bool {
 //
 // It returns players sorted by ID and a per-player index lookup.
 func validate(req PairRequest) ([]Player, map[string]int, error) {
+	// The original endpoint bounds scores only by non-negativity.
+	return validateMaxScore(req, -1)
+}
+
+// validateMaxScore is validate with an additional upper bound on each
+// player's score. A negative maxScore means "no upper bound".
+func validateMaxScore(req PairRequest, maxScore int) ([]Player, map[string]int, error) {
 	n := len(req.Players)
 	if n < 4 || n > 12 {
 		return nil, nil, validationf("expected 4..12 players, got %d", n)
@@ -56,6 +63,9 @@ func validate(req PairRequest) ([]Player, map[string]int, error) {
 		}
 		if p.Score < 0 {
 			return nil, nil, validationf("player %q has negative score %d", p.ID, p.Score)
+		}
+		if maxScore >= 0 && p.Score > maxScore {
+			return nil, nil, validationf("player %q score %d exceeds maximum %d", p.ID, p.Score, maxScore)
 		}
 		byID[p.ID] = i
 	}
