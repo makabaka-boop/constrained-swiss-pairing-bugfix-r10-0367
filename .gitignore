@@ -1,0 +1,11 @@
+/pairing
+*.test
+
+node_modules/
+dist-test/
+dist/
+__pycache__/
+*.pyc
+*.db
+.pytest_cache/
+*.tsbuildinfo
